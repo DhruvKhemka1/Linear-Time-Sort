@@ -1,0 +1,719 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage[hidelinks]{hyperref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{fact}[theorem]{Fact}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\Fh}{\widehat{F}}
+\newcommand{\fh}{\widehat{f}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\ceil}[1]{\left\lceil #1 \right\rceil}
+\newcommand{\floor}[1]{\left\lfloor #1 \right\rfloor}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\xmin}{x_{\min}}
+\newcommand{\xmax}{x_{\max}}
+\newcommand{\G}{\mathcal{G}}
+
+\title{Why \code{distribution\_sort} Runs in Expected Linear Time}
+\author{Analysis of \code{Linear Time Sort/distribution\_sort.py}}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\code{distribution\_sort} fits a model $\Fh$ of the cumulative distribution
+function (CDF) of its input, drops each element $x$ into bucket
+$\floor{n\,\Fh(x)}$, and sorts each bucket. We prove that it always returns
+the input in sorted order; that on every input it takes $O(n\log n)$ time;
+and that when the values are independent draws from a continuous
+distribution, its expected time is
+$(34+5\chi^2)\,n+O(\sqrt n)$, where $\chi^2$ is the $\chi^2$-distance
+between the data's density and the model's density. In particular the
+expected time is linear whenever the model fits, and even when it fits
+only roughly. We also prove the limit of the method: if one value repeats
+a constant fraction of the time, no CDF model can avoid
+$\Omega(n\log n)$ time, which is what the benchmark on file timestamps
+showed.
+\end{abstract}
+
+\section*{Results at a glance}
+\begin{center}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}>{\raggedright}p{0.40\textwidth}>{\raggedright}p{0.34\textwidth}>{\raggedright\arraybackslash}p{0.20\textwidth}@{}}
+\toprule
+Situation & Bound & Where proved\\
+\midrule
+Any input & always sorted & Theorem~\ref{thm:correct}\\
+Any input & $\le 5n\log_2 n+98n+C$ steps & Theorem~\ref{thm:worst}\\
+Model exactly right (idealised) & $\le 34n+C$ expected & Corollary~\ref{cor:ideal}\\
+Independent continuous data, model at $\chi^2$-distance $\chi^2$ & $\le(34+5\chi^2)n+O(\sqrt n)$ expected & Theorem~\ref{thm:main}\\
+Uniform data, uniform model chosen & $\le 34n+O(\sqrt n)$ expected & Corollary~\ref{cor:uniform}\\
+Any density with $\mu\le f\le M$ on a bounded interval, empirical model & $\le(29+15M/\mu)\,n+O(\sqrt n)$ expected & Corollary~\ref{cor:empirical}\\
+A value with probability $\pi>0$ & $\ge\tfrac{\pi n}{2}\log_2\tfrac{\pi n}{2}$ expected, for any model & Proposition~\ref{prop:atoms}\\
+\bottomrule
+\end{tabular}
+\end{center}
+Here $C$ is a constant that does not depend on $n$ (it covers the work done
+on the fixed-size sample). The constants are upper bounds chosen to make
+each step easy to check, not predictions of the measured running time.
+
+\paragraph{The idea in one paragraph.} Placing an element costs $O(1)$, so
+placement is linear. Sorting a bucket of $k$ elements costs at most a
+constant times $k^2$, so all the bucket sorts together cost
+$O\bigl(\sum_j N_j^2\bigr)$, where $N_j$ is the size of bucket $j$. If the
+model were the true CDF $F$, then $F(X)$ would be uniform on $[0,1]$
+(Lemma~\ref{lem:pit}), so each element would land in each bucket with
+probability exactly $1/n$. Each $N_j$ would then be
+$\mathrm{Binomial}(n,1/n)$, with $\E[N_j^2]<2$, and the bucket sorts would
+cost less than a constant times $2n$ in expectation. The rest of the proof
+removes two idealisations: the model is only approximately $F$ (this costs
+a factor $1+\chi^2$), and it is built from the same data it then sorts
+(this costs only $O(\sqrt n)$).
+
+\paragraph{Relation to the earlier proof.} \code{distribution\_sort\_proof.tex}
+analyses an earlier version of the algorithm, which has recursion,
+discrete models and an all-equal check. This document follows the same
+structure for the current, simpler version. One thing is new here: the
+earlier proof treated the model as independent of the data (its
+assumption (A2)), whereas Lemma~\ref{lem:condition} below proves the
+expected-time bound without that assumption.
+
+%======================================================================
+\section{The algorithm}\label{sec:alg}
+%======================================================================
+
+The code has two constants: \code{BIG\_BUCKET} $=64$ and
+\code{SAMPLE\_SIZE} $=1000$. A call on a list of $n$ numbers performs these
+steps.
+
+\begin{enumerate}[label=\textbf{D\arabic*.},leftmargin=3em]
+\item \textbf{Small input.} If $n\le 64$, insertion-sort a copy of the list
+  and return it.
+\item \textbf{Sample.} Let $s=\min(n,1000)$. Choose $s$ distinct positions
+  uniformly at random with \code{random.sample}, and add the list's minimum
+  $\xmin$ and maximum $\xmax$. Sort the resulting $s+2$ values into
+  $q_0\le q_1\le\dots\le q_L$, where $L=s+1$. Note $q_0=\xmin$ and
+  $q_L=\xmax$.
+\item \textbf{Model.} Fit three candidates to $q_0,\dots,q_L$: a uniform CDF
+  on $[q_0,q_L]$, a Normal CDF with the sample mean and standard deviation,
+  and an Exponential CDF shifted to start at $q_0$. A candidate is accepted
+  if its Kolmogorov--Smirnov distance to the sample is below
+  $1.36/\sqrt{L+1}$; the accepted candidate with the smallest distance
+  becomes the model $\Fh$. If none is accepted, $\Fh$ is the
+  \emph{empirical CDF}: with $c(x)=\#\{i:q_i\le x\}$,
+  \[
+  \Fh(x)=
+  \begin{cases}
+  0 & c(x)=0,\\[2pt]
+  \dfrac{1}{L}\Bigl(c(x)-1+\dfrac{x-q_{c(x)-1}}{q_{c(x)}-q_{c(x)-1}}\Bigr) & 1\le c(x)\le L,\\[8pt]
+  1 & c(x)=L+1.
+  \end{cases}
+  \]
+  (When $1\le c(x)\le L$ we have $q_{c(x)-1}\le x<q_{c(x)}$, so the
+  denominator is positive.)
+\item \textbf{Place.} Create $n$ empty buckets and append each element $x$
+  to bucket
+  \[
+  \beta(x)=\min\bigl(n-1,\ \max(0,\ \mathrm{int}(n\,\Fh(x)))\bigr).
+  \]
+\item \textbf{Finish each bucket.} A bucket of size $k\le 64$ is
+  insertion-sorted. A bucket of size $k>64$ is merge-sorted (the
+  \emph{safety net}).
+\item \textbf{Join} the buckets in order and return the result.
+\end{enumerate}
+
+\paragraph{Conventions.} We use the RAM model. A \emph{step} is one
+iteration of any loop, including loops inside library routines (copying or
+slicing a list, \code{min}, \code{max}, \code{sorted}, \code{bisect},
+\code{random.sample}). The straight-line code around an iteration counts as
+part of it; a call to \code{erf} or \code{exp} counts as one step; appending
+to a list counts as one step (CPython over-allocates lists, so this holds in
+amortised time up to a constant factor). Each step costs $O(1)$ machine
+time. Real numbers are treated as exact (Remark~\ref{rem:float} discusses
+floating point). All logarithms are base~2. $T(n)$ is the number of steps
+of a call on $n$ elements.
+
+%======================================================================
+\section{Elementary facts}
+%======================================================================
+
+\begin{fact}[Insertion sort]\label{fact:ins}
+Insertion sort on $k\ge1$ elements takes at most $(k-1)+\binom{k}{2}\le k^2$
+steps.
+\end{fact}
+\begin{proof}
+The outer loop runs $k-1$ times. Each inner-loop step moves one element
+past the element being inserted, and each of the $\binom k2$ pairs is
+moved past each other at most once. Finally
+$(k-1)+\tfrac{k(k-1)}{2}\le k^2$.
+\end{proof}
+
+\begin{fact}[Merge sort]\label{fact:merge}
+\code{merge\_sort} on $k\ge1$ elements takes at most $5k(\ceil{\log k}+1)$
+steps and at least $k(\floor{\log k}+1)$ steps.
+\end{fact}
+\begin{proof}
+A call on $k\ge2$ elements copies its input (\code{list(values)}), slices it
+into halves of sizes $\floor{k/2}$ and $\ceil{k/2}$, recurses on both, and
+merges. Using $\floor{\floor{x}/2}=\floor{x/2}$ and
+$\ceil{\ceil{x}/2}=\ceil{x/2}$, every call at recursion depth $d$ has
+between $\floor{k/2^d}$ and $\ceil{k/2^d}$ elements.
+
+\emph{Upper bound.} At depth $\ceil{\log k}$ every call has one element, so
+there are at most $\ceil{\log k}+1$ depths. The calls at one depth work on
+disjoint parts of the input. Per element at one depth, a call spends at most
+5 steps: one to copy it, one to slice it, at most two in merging (one loop
+iteration, or one slice plus one extend for leftovers), and one for its
+share of call overhead (a depth has at most as many calls as elements).
+
+\emph{Lower bound.} For $d\le\floor{\log k}$ every call at depth $d$ has at
+least $\floor{k/2^d}\ge1$ element, and every call at depth $d-1$ has at
+least $2$ elements and therefore recurses. So every element is in some call
+at each depth $0,1,\dots,\floor{\log k}$, and each such call copies it once.
+\end{proof}
+
+\begin{fact}[Binary search]\label{fact:bs}
+Evaluating the empirical CDF uses \code{bisect\_right} on $L+1\le 1002$
+points, which takes at most $10$ iterations.
+\end{fact}
+\begin{proof}
+The search interval starts with length $L+1\le1002$ and each iteration at
+least halves it (rounding down), so there are at most
+$\floor{\log 1002}+1=10$ iterations.
+\end{proof}
+
+\begin{fact}[\code{random.sample}]\label{fact:sample}
+Drawing $s\le n$ positions with \code{random.sample} takes at most $5n$
+steps in expectation, and the number of steps is independent of which
+positions are returned.
+\end{fact}
+\begin{proof}
+CPython computes $\sigma=21$, plus $4^{\ceil{\log_4(3s)}}\ge3s$ if $s>5$.
+Each random draw calls \code{randbelow}, a rejection loop that takes fewer
+than 2 iterations on average.
+\begin{itemize}
+\item If $n\le\sigma$, it allocates the result ($s$ steps), copies the list
+  ($n$ steps) and makes $s$ draws and swaps (fewer than $3s$ steps on
+  average), at most $n+4s\le5n$ in total.
+\item Otherwise $n>\sigma\ge3s$, and it draws positions until it has $s$
+  distinct ones. While fewer than $s$ have been chosen, a draw repeats an
+  earlier one with probability below $s/n<1/3$, so each new position needs
+  fewer than $1.5$ draws on average. The total is at most
+  $s+1.5s\cdot3+s<7s<3n$ on average.
+\end{itemize}
+In both cases the only randomness in the step count comes from rejection
+loops, and in a rejection loop the number of trials is independent of the
+value finally accepted. So the step count is independent of the positions
+returned.
+\end{proof}
+
+\begin{fact}[Second moment of a binomial]\label{fact:binom}
+If $N\sim\mathrm{Binomial}(n,p)$, then $\E[N^2]=np(1-p)+n^2p^2\le np+n^2p^2$.
+\end{fact}
+
+\begin{fact}[Cauchy--Schwarz inequality]\label{fact:cs}
+For non-negative functions $u,v$ on an interval $I$,
+$\int_I uv\le\bigl(\int_I u^2\bigr)^{1/2}\bigl(\int_I v^2\bigr)^{1/2}$.
+\end{fact}
+
+%======================================================================
+\section{Correctness}
+%======================================================================
+
+\begin{lemma}[The model never decreases]\label{lem:mono}
+Every model built in step D3 is non-decreasing on $[\xmin,\xmax]$, which
+contains every input value. Hence the bucket map is non-decreasing: if
+$x\le y$ then $\beta(x)\le\beta(y)$.
+\end{lemma}
+\begin{proof}
+The Normal model is a CDF. The uniform model $(x-q_0)/(q_L-q_0)$ is
+increasing. The Exponential model is $0$ up to $q_0$ and
+$1-e^{-(x-q_0)/\lambda}$ after it, with $\lambda>0$; both pieces are
+non-decreasing and they agree at $q_0$.
+
+For the empirical CDF, $c(x)$ is non-decreasing in $x$. While $c(x)$ stays
+equal to some $c\in[1,L]$, the formula is linear with positive slope and
+takes values in $[\frac{c-1}{L},\frac{c}{L})$. When $c(x)$ jumps from $c$ to
+$c'>c$ (at a sample point, possibly repeated), the value just before the
+jump is below $\frac cL$ and the value at the jump is $\frac{c'-1}{L}\ge\frac cL$,
+or $1$ if $c'=L+1$. Below $q_0$ the value is $0$, the smallest possible.
+
+Finally, $\beta$ composes $\Fh$ with three non-decreasing maps: multiplying
+by $n$, \code{int}, and clamping to $[0,n-1]$. (\code{int} truncates towards
+zero rather than rounding down, but the two differ only on negative
+numbers, which the clamp sends to $0$ either way.)
+\end{proof}
+
+\begin{theorem}[Correctness]\label{thm:correct}
+For every input list, \code{distribution\_sort} stops and returns its
+elements in non-decreasing order.
+\end{theorem}
+\begin{proof}
+If $n\le64$, insertion sort is correct. Otherwise, let $x$ be in bucket
+$j$ and $y$ in bucket $j'$ with $j<j'$. If $x>y$, Lemma~\ref{lem:mono} would
+give $j=\beta(x)\ge\beta(y)=j'$, a contradiction. So every element of an
+earlier bucket is at most every element of a later bucket. Each bucket is
+sorted by insertion sort or merge sort, both of which are correct and stop.
+Joining sorted buckets that are in order gives a sorted list.
+\end{proof}
+
+%======================================================================
+\section{Where the time goes}
+%======================================================================
+
+\begin{lemma}[Work outside the bucket sorts]\label{lem:overhead}
+For $n>64$, the work outside the bucket sorts in step D5 is $W\le A\,n+C$
+in expectation, with $A=24$ and $C$ a constant that does not depend on
+$n$. The bound also holds conditional on the positions sampled and on the
+data.
+\end{lemma}
+\begin{proof}
+The table lists every part of steps D1--D6 except the bucket sorts.
+\begin{center}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}>{\raggedright}p{0.36\textwidth}r>{\raggedright\arraybackslash}p{0.46\textwidth}@{}}
+\toprule
+Work & Steps $\le$ & Reason\\
+\midrule
+D1 copy the input & $n$ & one pass\\
+D2 \code{random.sample} & $5n$ & Fact~\ref{fact:sample}, in expectation\\
+D2 $\min$ and $\max$ & $2n$ & one pass each\\
+D2 build the sample list & $n+2$ & $s+2\le n+2$ elements\\
+D2 sort the sample; D3 fit three models, KS distances, build $\Fh$ & $C$ & every loop runs over the $L+1\le1002$ sample points, so the work is bounded by a constant\\
+D4 create $n$ buckets & $n$ & one pass\\
+D4 place each element & $12n$ & per element: 1 iteration, $\le10$ search steps (Fact~\ref{fact:bs}), 1 append\\
+D5, D6 visit buckets and join & $2n$ & one iteration per bucket, one copy per element\\
+\midrule
+Total & $24n+C$ &\\
+\bottomrule
+\end{tabular}
+\end{center}
+The constant $2$ from the sample list is absorbed into $C$. Only the
+\code{random.sample} row is random, and by Fact~\ref{fact:sample} its step
+count is independent of the positions returned and of the data (which the
+sampler never looks at), so conditioning on them does not change its
+expectation.
+\end{proof}
+
+\begin{lemma}[Cost of one bucket]\label{lem:bucket}
+Let $\mathrm{cost}(k)$ be the steps used to sort a bucket of size $k$ in
+step D5. Then
+\[
+\mathrm{cost}(k)\le
+\begin{cases}
+k^2\le 64k & k\le 64,\\
+5k(\ceil{\log k}+1) & k>64,
+\end{cases}
+\qquad\text{and in all cases}\qquad \mathrm{cost}(k)\le 5k^2 .
+\]
+\end{lemma}
+\begin{proof}
+The first case is Fact~\ref{fact:ins} and the second is
+Fact~\ref{fact:merge}. Since $\ceil{\log k}+1\le k$ for every $k\ge1$,
+both cases are at most $5k^2$.
+\end{proof}
+
+Writing $N_j$ for the size of bucket $j$, the two lemmas give, for $n>64$,
+\begin{equation}\label{eq:split}
+T(n)=W+\sum_{j=0}^{n-1}\mathrm{cost}(N_j),\qquad \E[W]\le An+C,\qquad
+\sum_j N_j=n .
+\end{equation}
+
+%======================================================================
+\section{Worst case: \texorpdfstring{$O(n\log n)$}{O(n log n)} for every input}
+%======================================================================
+
+\begin{theorem}[Worst case]\label{thm:worst}
+For every input with $n>64$ elements,
+\[
+\E[T(n)]\le 5n\log n+(A+74)\,n+C=5n\log n+98n+C,
+\]
+where the expectation is only over \code{random.sample}'s internal draws.
+For $n\le64$, $T(n)\le n+n^2\le 65n$.
+\end{theorem}
+\begin{proof}
+By Lemma~\ref{lem:bucket}, a bucket with $N_j\le64$ costs at most $64N_j$,
+and a bucket with $N_j>64$ costs at most
+$5N_j(\ceil{\log N_j}+1)\le5N_j(\log n+2)$, since $N_j\le n$. Adding over
+all buckets and using $\sum_j N_j=n$,
+\[
+\sum_j\mathrm{cost}(N_j)\le 64n+5n(\log n+2)=5n\log n+74n .
+\]
+Add $\E[W]\le An+C$ from \eqref{eq:split}. For $n\le64$, step D1 copies the
+list and insertion-sorts it (Fact~\ref{fact:ins}).
+\end{proof}
+
+\begin{remark}
+This bound is what the safety net buys. Without it, one overfull bucket of
+size $\Theta(n)$ would be insertion-sorted in $\Theta(n^2)$ time. Replacing
+\code{random.sample} by a partial Fisher--Yates shuffle would make the
+bound hold on every run, without the expectation.
+\end{remark}
+
+%======================================================================
+\section{Expected linear time for continuous data}
+%======================================================================
+
+\subsection{The ideal case}
+
+\begin{lemma}[Probability integral transform]\label{lem:pit}
+If $X$ has a continuous CDF $F$, then $F(X)$ is uniform on $[0,1]$.
+\end{lemma}
+\begin{proof}
+Fix $u\in(0,1)$. Since $F$ is continuous and non-decreasing, with limits $0$
+and $1$, the set $\{x:F(x)\le u\}$ is non-empty and bounded above, and it
+contains its supremum $x_u$; continuity also gives $F(x_u)=u$. Then
+$F(X)\le u$ exactly when $X\le x_u$, so
+$\Prob(F(X)\le u)=F(x_u)=u$.
+\end{proof}
+
+\begin{corollary}[Ideal model]\label{cor:ideal}
+Suppose the data are independent draws from a continuous CDF $F$ and,
+hypothetically, $\Fh=F$ and $\Fh$ were chosen independently of the data.
+Then $\E[T(n)]\le(A+10)\,n+C=34n+C$.
+\end{corollary}
+\begin{proof}
+By Lemma~\ref{lem:pit}, element $i$ lands in bucket $j$ when $nF(X_i)$ lies in
+$[j,j+1)$ (or in $[n-1,n]$ for the last bucket), which has probability
+exactly $1/n$. The elements are independent, so
+$N_j\sim\mathrm{Binomial}(n,1/n)$ and, by Fact~\ref{fact:binom},
+$\E[N_j^2]=1-\tfrac1n+1<2$. By Lemma~\ref{lem:bucket} and
+\eqref{eq:split},
+$\E[T]\le An+C+5\sum_j\E[N_j^2]<An+C+10n$.
+\end{proof}
+
+The code differs from this ideal in two ways: $\Fh$ is only an
+approximation of $F$, and $\Fh$ is computed from a sample of the same list
+it then sorts. The next two subsections deal with each.
+
+\subsection{The model comes from the data}
+
+\paragraph{Assumption (A).} The input values $X_1,\dots,X_n$ are independent
+and identically distributed with a density $f$ and CDF $F$. (So, with
+probability 1, no two values are equal.)
+
+\paragraph{Notation.} Let $J$ be the set of sampled positions, $\iota$ and
+$\kappa$ the positions of the minimum $\xmin$ and maximum $\xmax$, and
+$E=J\cup\{\iota,\kappa\}$, so $|E|\le s+2$. Let $R$ be the remaining
+positions. Let $\G$ denote the information $(J,\iota,\kappa,(X_i)_{i\in E})$.
+Write $Z=F(\xmax)-F(\xmin)$ and let
+\[
+f_\ast(x)=\frac{f(x)}{Z}\quad\text{for }\xmin<x<\xmax,\qquad f_\ast(x)=0\text{ otherwise}
+\]
+be the density $f$ restricted to $(\xmin,\xmax)$.
+
+\begin{lemma}[Conditioning on the model's inputs]\label{lem:condition}
+\textup{(i)} The model $\Fh$, and the bucket of every element in $E$, are
+determined by $\G$.
+\textup{(ii)} Given $\G$, the values $(X_i)_{i\in R}$ are independent with
+density $f_\ast$.
+\end{lemma}
+\begin{proof}
+(i) Steps D2 and D3 use only the sampled values, $\xmin=X_\iota$ and
+$\xmax=X_\kappa$.
+
+(ii) \code{random.sample} uses its own random numbers, so $J$ is independent
+of the data. Fix $J$, $\iota=i_0$ and $\kappa=k_0$ (with $i_0\ne k_0$, which
+holds with probability 1 when $n\ge2$). The joint density of the data is
+$\prod_i f(x_i)$, restricted to the event that $x_{i_0}<x_i<x_{k_0}$ for
+every $i\ne i_0,k_0$. Now also fix the values $x_i$ for $i\in E$. The
+conditions involving positions in $E$ are then fixed, and what remains of
+the density of $(x_i)_{i\in R}$ is proportional to
+$\prod_{i\in R}f(x_i)\,\mathbf 1\{\xmin<x_i<\xmax\}$. This is a product, so
+the values are independent, each with density proportional to
+$f\cdot\mathbf 1_{(\xmin,\xmax)}$, which is $f_\ast$.
+\end{proof}
+
+\subsection{The model is only approximately right}
+
+From here on, condition on $\G$, so that $\Fh$ is a fixed function. Every
+model in D3 is continuous with a derivative $\fh$ except at finitely many
+points, apart from upward jumps of the empirical CDF at repeated sample
+points (which happen with probability 0 under Assumption~(A)).
+
+\begin{definition}
+The \emph{$\chi^2$-distance} from the data to the model is
+\[
+\chi^2=\chi^2(f_\ast\,\|\,\fh)=\int_{\xmin}^{\xmax}\frac{f_\ast(x)^2}{\fh(x)}\,dx-1,
+\]
+taken to be $+\infty$ if $\fh=0$ on a set where $f_\ast>0$. By
+Fact~\ref{fact:cs}, $1=\int f_\ast\le(\int f_\ast^2/\fh)^{1/2}(\int\fh)^{1/2}
+\le(\int f_\ast^2/\fh)^{1/2}$, so $\chi^2\ge0$, with equality exactly when
+$\fh=f_\ast$. For each bucket $j$ let
+$I_j=\{x\in(\xmin,\xmax):\beta(x)=j\}$ and $p_j=\int_{I_j}f_\ast$.
+\end{definition}
+
+\begin{lemma}[The model gives each bucket mass at most $1/n$]\label{lem:mass}
+For every bucket $j$, $\int_{I_j}\fh\le1/n$.
+\end{lemma}
+\begin{proof}
+By Lemma~\ref{lem:mono}, $I_j$ is an interval. On $I_j$, $n\Fh$ lies in
+$[j,j+1)$, or in $[0,1)$ for $j=0$, or in $[n-1,n]$ for $j=n-1$ (because of
+the clamp, using $0\le\Fh\le1$ on $[\xmin,\xmax]$). So $\Fh$ increases by at
+most $1/n$ across $I_j$. Split $I_j$ at the finitely many points where
+$\Fh$ is not differentiable. On each piece, $\int\fh$ equals the increase of
+$\Fh$ across the piece, and jumps at the split points only add to the
+total increase. So $\int_{I_j}\fh\le1/n$.
+\end{proof}
+
+\begin{lemma}[Collisions are rare]\label{lem:collide}
+$\displaystyle\sum_j p_j^2\le\frac{1+\chi^2}{n}$.
+\end{lemma}
+\begin{proof}
+If $\chi^2=\infty$ there is nothing to prove. Otherwise, by Fact~\ref{fact:cs}
+and Lemma~\ref{lem:mass},
+\[
+p_j=\int_{I_j}\frac{f_\ast}{\sqrt{\fh}}\cdot\sqrt{\fh}
+\le\Bigl(\int_{I_j}\frac{f_\ast^2}{\fh}\Bigr)^{1/2}\Bigl(\int_{I_j}\fh\Bigr)^{1/2}
+\le\Bigl(\frac1n\int_{I_j}\frac{f_\ast^2}{\fh}\Bigr)^{1/2}.
+\]
+Square, and add over $j$; the $I_j$ do not overlap and cover
+$(\xmin,\xmax)$, so $\sum_jp_j^2\le\frac1n\int f_\ast^2/\fh=\frac{1+\chi^2}{n}$.
+\end{proof}
+
+\begin{lemma}[Bucket sizes]\label{lem:moments}
+$\displaystyle\E\Bigl[\sum_j N_j^2\,\Big|\,\G\Bigr]\le(2+\chi^2)\,n+2(s+2)\sqrt{(1+\chi^2)\,n}+(s+2)^2.$
+\end{lemma}
+\begin{proof}
+Split $N_j=N_j'+S_j$, where $N_j'$ counts elements of $R$ in bucket $j$ and
+$S_j$ counts elements of $E$. By Lemma~\ref{lem:condition}, the $S_j$ are
+fixed given $\G$, with $\sum_jS_j=|E|\le s+2$, and each element of $R$
+lands in bucket $j$ independently with probability $p_j$, so
+$N_j'\sim\mathrm{Binomial}(|R|,p_j)$ with $|R|\le n$. Expanding
+$N_j^2=N_j'^2+2S_jN_j'+S_j^2$:
+\begin{itemize}
+\item By Fact~\ref{fact:binom}, $\sum_j\E[N_j'^2]\le\sum_j(np_j+n^2p_j^2)
+  \le n+n^2\cdot\frac{1+\chi^2}{n}=(2+\chi^2)\,n$, using $\sum_jp_j=1$ and
+  Lemma~\ref{lem:collide}.
+\item $\sum_j2S_j\E[N_j']\le2n\,(\max_jp_j)\sum_jS_j\le2n(s+2)\bigl(\sum_jp_j^2\bigr)^{1/2}
+  \le2(s+2)\sqrt{(1+\chi^2)\,n}$.
+\item $\sum_jS_j^2\le\bigl(\sum_jS_j\bigr)^2\le(s+2)^2$.\qedhere
+\end{itemize}
+\end{proof}
+
+\subsection{The main theorem}
+
+\begin{theorem}[Expected linear time]\label{thm:main}
+Under Assumption~(A), for $n>64$,
+\[
+\E[T(n)\mid\G]\le(A+10+5\chi^2)\,n+10(s+2)\sqrt{(1+\chi^2)\,n}+5(s+2)^2+C .
+\]
+With $A=24$ and $s+2\le1002$, this is $(34+5\chi^2)\,n+O(\sqrt n)$. Averaging
+over $\G$ (and using $\E\sqrt Y\le\sqrt{\E Y}$),
+\[
+\E[T(n)]\le\bigl(34+5\,\E[\chi^2]\bigr)\,n+10(s+2)\sqrt{(1+\E[\chi^2])\,n}+5(s+2)^2+C ,
+\]
+so the expected time is linear whenever $\E[\chi^2]$ is bounded
+independently of $n$. Theorem~\ref{thm:worst} applies in every case.
+\end{theorem}
+\begin{proof}
+By \eqref{eq:split} and Lemma~\ref{lem:bucket},
+$T\le W+5\sum_jN_j^2$. By Lemma~\ref{lem:overhead}, $\E[W\mid\G]\le An+C$.
+Multiply the bound of Lemma~\ref{lem:moments} by 5 and add.
+\end{proof}
+
+\begin{remark}[Why the total is linear]
+The proof charges every crowded bucket a \emph{quadratic} cost, yet the
+total is still linear. The reason is Lemma~\ref{lem:collide}: two random
+elements share a bucket with probability only about $(1+\chi^2)/n$, so
+crowded buckets are rare enough that even a quadratic cost adds up to
+$O(n)$. The constant $5(s+2)^2\approx5\times10^6$ comes from the at most
+$1002$ sampled points possibly sharing buckets. It is a crude bound, but it
+does not grow with $n$.
+\end{remark}
+
+\subsection{When is \texorpdfstring{$\chi^2$}{chi-squared} small?}
+
+\begin{corollary}[Uniform data]\label{cor:uniform}
+If the data are uniform on an interval and the uniform model is chosen,
+then $\chi^2=0$ and
+$\E[T(n)\mid\G]\le34n+10(s+2)\sqrt n+5(s+2)^2+C$.
+\end{corollary}
+\begin{proof}
+The uniform model is $\Fh(x)=(x-\xmin)/(\xmax-\xmin)$, so
+$\fh=1/(\xmax-\xmin)$ on $(\xmin,\xmax)$. A uniform density restricted to
+$(\xmin,\xmax)$ and rescaled is again uniform there, so $f_\ast=\fh$ and
+$\chi^2=0$. Apply Theorem~\ref{thm:main}.
+\end{proof}
+
+\begin{corollary}[Empirical model]\label{cor:empirical}
+Suppose $f$ is supported on a bounded interval $[\alpha,\beta]$, with
+$0<\mu\le f\le M$ there, and consider the empirical model of step D3. Then
+\[
+\E\bigl[1+\chi^2\,\big|\,J,\iota,\kappa,\xmin,\xmax\bigr]\le\frac{2(s+1)}{s}\cdot\frac M\mu\le\frac{3M}{\mu}.
+\]
+Hence the variant of the algorithm that always uses the empirical model
+satisfies $\E[T(n)]\le(29+15M/\mu)\,n+O(\sqrt n)$.
+\end{corollary}
+\begin{proof}
+Let $s'=|J\setminus\{\iota,\kappa\}|\ge s-2$ be the number of sampled values
+strictly between $\xmin$ and $\xmax$. By the argument of
+Lemma~\ref{lem:condition}(ii), given $(J,\iota,\kappa,\xmin,\xmax)$ these
+$s'$ values are independent with density $f_\ast$. Mapped through the CDF
+$F_\ast$ of $f_\ast$, they become $s'$ independent uniform points on
+$[0,1]$, while $\xmin\mapsto0$ and $\xmax\mapsto1$.
+
+The sample points split $(\xmin,\xmax)$ into $s'+1$ segments of positive
+length. (A repeated point, which occurs when $J$ contains $\iota$ or
+$\kappa$, gives a segment of length zero, which does not matter.) On a
+segment of length $\ell_k$, the empirical CDF rises by exactly $1/L$, so
+$\fh=1/(L\ell_k)$. Let $\omega_k=\int_{\text{segment }k}f_\ast$. On
+$(\xmin,\xmax)$ we have $\mu/Z\le f_\ast\le M/Z$, so
+$\omega_k\ge\mu\ell_k/Z$, that is $\ell_k\le Z\omega_k/\mu$, and
+$\int_{\text{segment }k}f_\ast^2\le(M/Z)\,\omega_k$. Therefore
+\[
+1+\chi^2=\sum_kL\ell_k\int_{\text{segment }k}f_\ast^2\le\sum_kL\cdot\frac{Z\omega_k}{\mu}\cdot\frac{M}{Z}\,\omega_k
+=\frac{LM}{\mu}\sum_k\omega_k^2 .
+\]
+The $\omega_k$ are the gaps between $s'$ independent uniform points on
+$[0,1]$ (including the gaps to $0$ and to $1$). Each of the $s'+1$ gaps has
+the $\mathrm{Beta}(1,s')$ distribution, with second moment
+$\frac{2}{(s'+1)(s'+2)}$, so $\E\sum_k\omega_k^2=\frac{2}{s'+2}$. With
+$L=s+1$ and $s'+2\ge s$, this gives the first bound. The second uses
+$s=\min(n,1000)\ge65$.
+
+For the running time, apply Theorem~\ref{thm:main} with
+$\E[\chi^2]\le3M/\mu-1$: $34+5(3M/\mu-1)=29+15M/\mu$.
+\end{proof}
+
+In the actual code, the empirical model is replaced by a named model only
+when the named model passes the Kolmogorov--Smirnov test, and in that case
+Theorem~\ref{thm:main} applies with the named model's $\chi^2$.
+
+\begin{remark}[Normal data with a fitted Normal model]
+For a Normal density $f$ with standard deviation $\sigma$ and a Normal model
+with $\hat\sigma$, the integral $\int f^2/\fh$ is a Gaussian integral whose
+exponent has $x^2$-coefficient $-\frac1{\sigma^2}+\frac1{2\hat\sigma^2}$. So
+it is finite exactly when $\hat\sigma^2>\sigma^2/2$. For small fitting
+errors, a second-order expansion (with the Fisher information as
+coefficients) gives
+$\chi^2(f\,\|\,\fh)\approx(\Delta\mu/\sigma)^2+2(\Delta\sigma/\sigma)^2$.
+With about 1000 sample points the relative errors are about $3\%$ and
+$2\%$, so $\chi^2\approx0.002$. Restricting to $(\xmin,\xmax)$ changes little:
+$1+\chi^2(f_\ast\|\fh)\le(1+\chi^2(f\|\fh))/Z^2$, and $Z\to1$ as $n$ grows.
+\end{remark}
+
+%======================================================================
+\section{Where linearity fails: repeated values}
+%======================================================================
+
+\begin{proposition}[A repeated value forces $\Omega(n\log n)$]\label{prop:atoms}
+Suppose the values are independent and some value $v$ has
+$\Prob(X=v)=\pi>0$. Then for every $n\ge130/\pi$, whatever model step D3
+chooses,
+\[
+\E[T(n)]\ge\bigl(1-e^{-\pi n/8}\bigr)\,\frac{\pi n}{2}\,\log\frac{\pi n}{2}.
+\]
+\end{proposition}
+\begin{proof}
+Let $K$ be the number of copies of $v$, so $K\sim\mathrm{Binomial}(n,\pi)$.
+All copies have the same bucket $\beta(v)$, because $\beta$ is a function
+of the value: no model can separate equal values. By the Chernoff bound,
+$\Prob(K<\pi n/2)\le e^{-\pi n/8}$. If $K\ge\pi n/2\ge65$, that bucket has
+more than 64 elements and is merge-sorted, which by Fact~\ref{fact:merge}
+costs at least $N(\floor{\log N}+1)\ge K\log K\ge\frac{\pi n}2\log\frac{\pi n}2$,
+where $N\ge K$ is the bucket's size and $x\log x$ is increasing.
+\end{proof}
+
+\begin{remark}[The benchmarks, and the fix]
+This is exactly the timestamp benchmark: $73\%$ of the files share one
+modification time, so $\pi\approx0.73$, and the sort was slower than plain
+merge sort. File sizes have many smaller repeated values. (A density does
+not exist for such data, so $\chi^2$ is undefined.)
+
+The proof also shows what to change. The expensive step is merge-sorting a
+bucket whose values are all equal. A single pass that checks whether all
+values in a bucket are equal costs $O(N)$ and makes such a bucket free to
+finish, which removes the $\Omega(n\log n)$ term for buckets holding one
+repeated value. Buckets that mix a repeated value with other values need a
+separate argument, like the pure/mixed bucket analysis in the earlier
+proof.
+\end{remark}
+
+%======================================================================
+\section{Discussion}
+%======================================================================
+
+\begin{remark}[Why the $\Omega(n\log n)$ sorting lower bound does not apply]
+Any \emph{comparison} sort needs $\Omega(n\log n)$ comparisons, even on
+average over random inputs, because it must tell apart $n!$ orderings. Step
+D4 does not compare elements with each other: it computes $\floor{n\Fh(x)}$
+with arithmetic, which locates $x$ among $n$ buckets in $O(1)$ time. All
+of the speed comes from this, and it pays off only when the model fits
+($\chi^2$ bounded).
+\end{remark}
+
+\begin{remark}[Why the sample size must be a constant]
+The empirical CDF finds $x$'s segment by binary search over the sample,
+which costs $\log(\text{sample size})$ steps. With a fixed sample of 1000
+this is at most 10 steps (Fact~\ref{fact:bs}). If the sample grew with $n$,
+placement alone would cost $\Theta(n\log n)$. The price of a fixed sample
+is that the empirical model's accuracy, and so its $\chi^2$, does not
+improve as $n$ grows; Corollary~\ref{cor:empirical} shows that it stays
+bounded anyway.
+\end{remark}
+
+\begin{remark}[Floating point]\label{rem:float}
+The proofs assume exact arithmetic. In floating point, correctness depends
+only on Lemma~\ref{lem:mono}, that is, on the computed $\Fh$ being
+non-decreasing. This holds because IEEE subtraction and division by a
+positive number are monotone, \code{erf} and \code{exp} are monotone in
+standard maths libraries, and the empirical CDF's interpolation fraction
+stays in $[0,1]$ after rounding. It also needs differences such as
+$\xmax-\xmin$ not to overflow, which holds for values below about
+$10^{308}$ in size. The running-time bounds do not depend on rounding.
+\end{remark}
+
+\begin{remark}[Connection to the measurements]
+For uniform and Normal data the fitted models have $\chi^2\approx0$, and the
+measured time per element stayed roughly flat from $10^4$ to $10^6$
+elements, as Theorem~\ref{thm:main} predicts. The extra slowdown observed
+above $10^5$ elements also hit merge sort and Python's built-in sort, so it
+comes from the machine rather than the algorithm (part of it was measured
+to be the garbage collector; the rest is most likely memory-cache misses),
+and the RAM model does not capture it.
+\end{remark}
+
+\appendix
+\section{Where every number comes from}
+\renewcommand{\arraystretch}{1.2}
+\begin{longtable}{@{}>{\raggedright}p{0.17\textwidth}p{0.77\textwidth}@{}}
+\toprule
+Number & Origin\\
+\midrule
+\endhead
+$64$ & \code{BIG\_BUCKET} in the code: the largest bucket that is insertion-sorted.\\
+$1000$ & \code{SAMPLE\_SIZE} in the code. With $\xmin$ and $\xmax$ added, the model sees at most $1002$ points.\\
+$1.36$ & KS acceptance threshold factor: the $95\%$ point of the Kolmogorov distribution. It affects which model is chosen, not the bounds.\\
+$10$ & Binary-search iterations on $\le1002$ points: $\floor{\log1002}+1=10$ (Fact~\ref{fact:bs}).\\
+$5$ & Steps per element per merge-sort level: copy, slice, two for merging, call overhead (Fact~\ref{fact:merge}). Also $\mathrm{cost}(k)\le5k^2$ (Lemma~\ref{lem:bucket}).\\
+$5n$ & Expected steps of \code{random.sample} (Fact~\ref{fact:sample}).\\
+$24$ ($A$) & Sum of the per-element costs in Lemma~\ref{lem:overhead}.\\
+$74$ & $64$ (small buckets) $+\,5\cdot2$ (from $\ceil{\log k}+1\le\log n+2$) in Theorem~\ref{thm:worst}.\\
+$98$ & $A+74$.\\
+$10$, $34$ & $5\cdot2$ from $\E[N_j^2]<2$; and $A+10$ (Corollary~\ref{cor:ideal}, Theorem~\ref{thm:main}).\\
+$2+\chi^2$ & $\sum_j\E[N_j'^2]\le n+n^2\cdot\frac{1+\chi^2}{n}$ (Lemma~\ref{lem:moments}).\\
+$s+2$ & At most this many elements (the sample, $\xmin$, $\xmax$) are not independent of the model (Lemma~\ref{lem:condition}).\\
+$2/(s'+2)$ & Expected sum of squared gaps between $s'$ uniform points (Corollary~\ref{cor:empirical}).\\
+$3M/\mu$ & $2(s+1)/s\cdot M/\mu$ with $s\ge65$ (Corollary~\ref{cor:empirical}).\\
+$29$, $15$ & $34+5(3M/\mu-1)$ (Corollary~\ref{cor:empirical}).\\
+$130/\pi$, $8$ & Need $\pi n/2\ge65$ for the safety net to trigger; Chernoff bound $\Prob(K<\tfrac12\E K)\le e^{-\E K/8}$ (Proposition~\ref{prop:atoms}).\\
+\bottomrule
+\end{longtable}
+
+\end{document}
